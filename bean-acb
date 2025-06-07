@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+
+import click
+import json
+import sys
+
+from datetime import date, timedelta
+from decimal import Decimal
+from enum import Enum
+from functools import reduce
+from typing import List, NamedTuple
+
+from beancount.loader import load_file
+from beancount.core import amount
+from beancount.core.data import Amount, Posting, Transaction
+from beancount.core.convert import convert_amount
+from beancount.core.prices import build_price_map, PriceMap
+
+
+class TransactionType(Enum):
+    BUY = 1
+    SELL = 2
+
+
+class ACBTransaction(NamedTuple):
+    date: date
+    type: TransactionType
+    ticker: str
+    shares: Decimal
+    price_per_share: Amount
+    commission: List[Amount]
+
+
+class ACBResult(NamedTuple):
+    ticker: str
+    date: date
+    type: TransactionType
+    amount: Amount
+    shares: Decimal
+    amount_per_share: Amount
+    commission: Amount
+    capital_gain: Amount
+    superficial_loss: bool
+    total_shares: Decimal
+    acb_change: Amount
+    total_acb: Amount
+    acb_per_share: Amount
+
+
+class TickerConfig(NamedTuple):
+    ticker: str
+    investment_accounts: List[str]
+    commission_accounts: List[str]
+
+
+def valid_ticker_posting(posting: Posting, conf: TickerConfig) -> bool:
+    """
+    Check if a posting meets these two conditions:
+        - its currency is the one specified in conf.ticker
+        - its account is a leaf of one of conf.investment_accounts
+    """
+    if posting.units.currency == conf.ticker:
+        return any(
+            posting.account.startswith(invst_acct)
+            for invst_acct in conf.investment_accounts
+        )
+
+    return False
+
+
+def parse_beancount_transactions(
+    ledger_path: str, conf: TickerConfig
+) -> (PriceMap, List[ACBTransaction]):
+    """
+    Parse beancount ledger and return list of relevant transactions to compute ACB.
+    """
+    entries, errors, _ = load_file(ledger_path)
+    if errors:
+        raise RuntimeError(f"Beancount parse errors: {errors}")
+
+    results = []
+    for entry in entries:
+        if not isinstance(entry, Transaction):
+            continue
+
+        ticker_postings = list(
+            filter(lambda p: valid_ticker_posting(p, conf), entry.postings)
+        )
+        if not ticker_postings:
+            # This transaction has not relevant postings
+            continue
+
+        shares = sum([p.units.number for p in ticker_postings])
+
+        if not (
+            all(p.units.number > 0 for p in ticker_postings)
+            or all(p.units.number < 0 for p in ticker_postings)
+        ):
+            # Make sure all postings for this security have the same number, script
+            # relies on that to determine if it's a sale or a buy.
+
+            if not shares:
+                # There is an exception to outter check if shares are moved
+                # between accounts. In that case this is not a taxable event
+                # and can be skipped for ACB tracking. It's detected by the sum
+                # of all ticker postings being equal to 0.
+                continue
+
+            raise ValueError("All ticker postings should have the same sign")
+
+        if shares > 0:
+            #
+            # BUY EVENT
+            #
+
+            action = TransactionType.BUY
+
+            # Gather all the costs and make sure they all have the same number and currency
+            costs = [p.cost for p in ticker_postings]
+            if not all(
+                cost.number == costs[0].number and cost.currency == costs[0].currency
+                for cost in costs
+            ):
+                raise ValueError("Not all costs are the same")
+
+            price_per_share = costs[0]
+        else:
+            #
+            # SELL EVENT
+            #
+
+            action = TransactionType.SELL
+
+            # Gather all the prices and make sure they are the same
+            prices = [p.price for p in ticker_postings]
+            if not all(price == prices[0] for price in prices):
+                raise ValueError("Not all prices are the same")
+
+            price_per_share = prices[0]
+            if price_per_share.number == 0:
+                raise ValueError("Price is zero")
+
+        # Collect all commissions for this transaction
+        commission = [
+            p.units
+            for p in entry.postings
+            if any(
+                p.account.startswith(comm_acct)
+                for comm_acct in conf.commission_accounts
+            )
+        ]
+
+        results.append(
+            ACBTransaction(
+                date=entry.date,
+                type=action,
+                ticker=conf.ticker,
+                shares=abs(shares),
+                price_per_share=price_per_share,
+                commission=commission,
+            )
+        )
+
+    return build_price_map(entries), results
+
+
+def has_daily_conversion_rate(
+    price_map: PriceMap, from_currency: str, to_currency: str, date: date
+) -> bool:
+    """
+    Check if a PriceMap contains the rate of exchange between two currencies on
+    a specific date.
+    """
+    rates = price_map[(from_currency, to_currency)]
+
+    return date in [d for d, val in rates]
+
+
+def is_superficial_loss(t: Transaction, transactions: List[Transaction]) -> bool:
+    """
+    WARNING:
+        The superficial loss detection is only implemented for the SAME security, not
+        *identical* ones, which is what Canadian Tax Code requires.
+
+    A sale is considered a superficial loss if:
+      - an identical property is bought in the 30 calendar days before and after the sale
+      - that property is held on the 30th day following the sale
+    """
+
+    total_shares = Decimal()
+    condition_buy_window = False
+    wnd = timedelta(days=30)
+
+    for tx in sorted(transactions, key=lambda x: x.date):
+        if tx.date > t.date + wnd:
+            return condition_buy_window and total_shares
+
+        if tx.type == TransactionType.BUY:
+            total_shares += tx.shares
+
+            if tx.date - wnd <= t.date <= tx.date + wnd:
+                condition_buy_window = True
+
+        elif tx.type == TransactionType.SELL:
+            total_shares -= tx.shares
+
+    return condition_buy_window and total_shares
+
+
+def compute_acb(
+    transactions: List[Transaction], price_map: PriceMap, currency: str
+) -> List[ACBResult]:
+    """
+    Compute the Adjusted Cost Base (ACB) for a given ticker according to Canadian tax rules.
+    """
+    zero_curr = Amount(Decimal(), currency)
+    total_shares = Decimal()
+    total_acb = zero_curr
+    results = []
+    conversion_disclaimer_printed = False
+
+    for tx in sorted(transactions, key=lambda x: x.date):
+        # reduce all commissions to a single value in the target currency.
+        # Each commission is converted using beancount's helper `convert_amount`
+        # and added up.
+        commission = reduce(
+            lambda x, y: amount.add(x, y),
+            [convert_amount(c, currency, price_map, tx.date) for c in tx.commission],
+            zero_curr,
+        )
+
+        # The conversion must be done with the daily rate according to tax code,
+        # so at least print a warning to make sure this is noticed.
+        # FIXME: some transactions might not have a specific date (like for
+        #        foreign financial instruments) but might still be tracked in
+        #        one's ledger and so will have a date attached to them. For
+        #        those, the rate of conversion shouldn't be the daily rate, it
+        #        could be added to transaction's meta info.
+        if tx.price_per_share.currency != currency and not has_daily_conversion_rate(
+            price_map, tx.price_per_share.currency, currency, tx.date
+        ):
+            if not conversion_disclaimer_printed:
+                print("Conversion rate between currencies must be provided for each day a transaction")
+                print("occurred in to accurately compute ACB. As some values are missing, results")
+                print("will only be approximation.")
+                conversion_disclaimer_printed = True
+
+            print(
+                f"    Missing conversion rate on {tx.date} from '{tx.price_per_share.currency}' to '{currency}'"
+            )
+
+        price_per_share = convert_amount(
+            tx.price_per_share, currency, price_map, tx.date
+        )
+        if price_per_share.currency != currency:
+            raise ValueError("Error converting from cost-currency to target currency")
+
+        if tx.type == TransactionType.BUY:
+            #
+            # ACB change is the total cost of acquisition, ie.
+            #    <nb of shares> * <price per share> + commission
+            # For a buy, we consider the <price per share> to be the cost
+            # associated with the posting.
+            #
+
+            cost = amount.mul(price_per_share, tx.shares)
+            cost = amount.add(cost, commission)
+
+            # Change the total ACB by adding the total acquisition cost
+            total_acb = amount.add(total_acb, cost)
+            total_shares += tx.shares
+            acb_per_share = amount.div(total_acb, total_shares)
+
+            results.append(
+                ACBResult(
+                    tx.ticker,
+                    tx.date,
+                    "BUY",
+                    cost,
+                    tx.shares,
+                    price_per_share,  # ACB website includes the commission in this field
+                    commission,
+                    zero_curr,
+                    False,
+                    total_shares,
+                    cost,
+                    total_acb,
+                    acb_per_share,
+                )
+            )
+        elif tx.type == TransactionType.SELL:
+            if total_shares < tx.shares:
+                raise ValueError(f"Not enough shares to sell on {tx.date}")
+            superficial_loss = False
+
+            # Total sale price is <ACB per share> * <number of sold shares>
+            total_proceeds = amount.mul(price_per_share, tx.shares)
+
+            # Remove the commission from total proceeds to compute capital gain
+            proceeds = amount.sub(total_proceeds, commission)
+
+            # the ACB reduction for a sale is based on the current (meaning
+            # before this sale is taken into account) ACB price per share.
+            acb_reduction = amount.mul(acb_per_share, tx.shares)
+
+            # In short, capital gain is computed as follows:
+            #
+            #                <sale price> * <number of shares>
+            #    -                                <commission>
+            #    - <current ACB / share > * <number of shares>
+            #      -------------------------------------------
+            #    =                              <capital gain>
+            capital_gain = amount.sub(proceeds, acb_reduction)
+
+            # If the capital gain is negative and this sale event is subject to
+            # the superficial loss rule (see function in charge of finding
+            # these transactions), tax code states that the amount of the
+            # superficial loss can be added to the adjusted cost base of the
+            # remaining (or substituted) security, effectively reducing future
+            # capital gains.
+            if capital_gain.number < 0 and is_superficial_loss(tx, transactions):
+                # In our case, that means we can substract computed capital
+                # gain from ACB reduction, effectively making it smaller.
+                # Note that as capital gain is negative value, we use
+                # amount.add to get expected result.
+                acb_reduction = amount.add(acb_reduction, capital_gain)
+                superficial_loss = True
+
+            total_shares -= tx.shares
+
+            if total_shares:
+                total_acb = amount.sub(total_acb, acb_reduction)
+                acb_per_share = amount.div(total_acb, total_shares)
+            else:
+                total_acb = zero_curr
+                acb_per_share = zero_curr
+
+            results.append(
+                ACBResult(
+                    tx.ticker,
+                    tx.date,
+                    "SELL",
+                    total_proceeds,
+                    tx.shares,
+                    price_per_share,  # ACB website includes the commission in this field
+                    commission,
+                    capital_gain,
+                    superficial_loss,
+                    total_shares,
+                    acb_reduction,
+                    total_acb,
+                    acb_per_share,
+                )
+            )
+        else:
+            raise ValueError(f"Unknown transaction type: {tx.type}")
+
+    return results
+
+def TickerConfigFromJson(path: str) -> TickerConfig:
+    with open(path, 'r') as tickConfFile:
+        j = json.load(tickConfFile)
+
+        for key, val in j.items():
+            return TickerConfig(key, val['investments'], val['commissions'])
+
+@click.command()
+@click.argument("ledger-path")
+@click.argument("security-config")
+def main(ledger_path: str, security_config: str):
+    """Compute Adjusted Cost Base (ACB) for a given security.
+
+    The security config file should look like this:
+
+        \b
+        {
+          "AAPL": {
+            "investments": [
+              "Assets:Investments:Taxable"
+            ],
+            "commissions": [
+              "Expenses:Financial:Fees"
+            ]
+          }
+        }
+
+    \b
+    Where:
+      "AAPL" is the currency in beancount's ledger of the security
+      "investments" is a list of accounts where the security is tracked
+      "commissions" is a list of accounts where commissions are expensed against
+
+    Matching *doesn't* support regex, the posting account must start with one
+    of the accounts in "investments". The example will match transactions where
+    "AAPL" shares increases or decreases in accounts starting with
+    "Assets:Investments:Taxable".
+    """
+    print("")
+    print("                       *** WARNING ***")
+    print("This is a partial implementation of the Adjusted Cost Base rule, it might")
+    print("contain errors and should not be relied upon for declaring taxes.")
+    print("")
+
+    conf = TickerConfigFromJson(security_config)
+
+    price_map, transactions = parse_beancount_transactions(ledger_path, conf)
+    acb_history = compute_acb(transactions, price_map, "CAD")
+
+    print("")
+
+    if any(h.superficial_loss for h in acb_history):
+        print("An (X) in the capital gain column tags transaction that have been identified")
+        print("as being subject of the superficial loss rule. These losses cannot be deducted")
+        print("from income but the loss is added to ACB, decreasing future capital gain when")
+        print("the security is sold.")
+        print("")
+
+    header = "Tick |"
+    header += "    Date    |"
+    header += " Type |"
+    header += "   Amount   |"
+    header += " Shares |"
+    header += " Amt/sr |"
+    header += "  Comm |"
+    header += "     Cap Gain    |"
+    header += " Share Bal |"
+    header += "  ACB Chng  |"
+    header += "   New ACB  |"
+    header += "  ACB/Shr  "
+    print(header)
+    print("-" * len(header))
+
+    row = "{h.ticker:>4} |"
+    row += " {h.date:%Y-%m-%d} |"
+    row += " {h.type:>4} |"
+    row += " {h.amount.number:>10.2f} |"
+    row += " {h.shares:>6.2f} |"
+    row += " {h.amount_per_share.number:>6.2f} |"
+    row += " {h.commission.number:>6.3f} |"
+    row += " {h.capital_gain.number:>10.2f}{superficial_loss} |"
+    row += " {h.total_shares:>9.2f} |"
+    row += " {h.acb_change.number:>10.2f} |"
+    row += " {h.total_acb.number:>10.2f} |"
+    row += " {h.acb_per_share.number:>10.2f}"
+
+    for h in reversed(acb_history):
+        superficial_loss = " (X)" if h.superficial_loss else "    "
+        print(row.format(h=h, superficial_loss=superficial_loss))
+
+
+if __name__ == "__main__":
+    main()
